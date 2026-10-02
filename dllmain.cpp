@@ -36,7 +36,7 @@ void init() {
         am::fs::path rom = g_dir / "rom", mods = g_dir / "mods";
         if (!am::fs::is_directory(rom) || !am::fs::is_directory(mods)) { t_busy = false; return; }
         std::error_code ec; am::fs::remove(mods / "mod_loader.log", ec);
-        logmsg("Anymaker mod injector starting. Game files are never modified.");
+        logmsg("AnyModder loaded.");
         am::Result R = am::build(rom, mods);
         for (auto& l : R.log) logmsg(l); for (auto& w : R.warns) logmsg("WARN " + w);
         if (R.mods == 0) { logmsg("no enabled mods - game runs untouched"); t_busy = false; return; }
