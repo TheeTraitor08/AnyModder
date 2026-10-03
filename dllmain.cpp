@@ -39,7 +39,7 @@ void init() {
     try {
         am::fs::path rom = g_dir / "rom", mods = g_dir / "mods";
         if (!am::fs::is_directory(rom) || !am::fs::is_directory(mods)) { t_busy = false; t_init = false; return; }
-        std::error_code ec; am::fs::remove(mods / "mod_loader.log", ec);
+        std::error_code ec; am::fs::remove(mods / "Anymodder.log", ec);
         logmsg("AnyModder loaded.");
         am::Result R = am::build(rom, mods);
         for (auto& l : R.log) logmsg(l); for (auto& w : R.warns) logmsg("WARN " + w);
@@ -78,8 +78,7 @@ void init() {
             am::fs::create_directories(wdir); am::fs::copy_file(cur, work, am::fs::copy_options::overwrite_existing);
             g_map[norm(gcl.wstring())] = work.wstring();
             std::string fin = am::read_file(work), org = am::read_file(gcl);
-            char crc[16]; snprintf(crc, sizeof crc, "%08X", am::crc32_of(fin));
-            logmsg("final game.gcl: " + std::to_string(fin.size()) + " bytes, crc32 " + crc + (fin == org ? " (identical to original)" : " (modified)"));
+            logmsg("final game.gcl: " + std::to_string(fin.size()) + " bytes" + (fin == org ? " (identical to original)" : " (modified)"));
             if (am::fs::file_size(gcl) != origSize || am::fs::last_write_time(gcl) != origTime) logmsg("WARN original bin\\game.gcl changed while mods loaded");
         } else if (!R.natives.empty()) logmsg("WARN bin\\game.gcl not found - native mods skipped (nothing to patch)");
         logmsg("ready: " + std::to_string(R.files.size()) + " file(s) replaced, " + std::to_string(R.assets.size()) + " asset(s) added");
@@ -232,6 +231,42 @@ void* exe_iat_value(const char* fn) {
     }
     return nullptr;
 }
+
+am::fs::path find_native_gcl_output(const am::fs::path& root,
+                                    const am::fs::path& inputPath,
+                                    const std::string& inputData) {
+    std::error_code ec;
+    am::fs::path best;
+    std::uintmax_t bestSize = 0;
+
+    if (!am::fs::is_directory(root, ec)) return {};
+
+    for (am::fs::recursive_directory_iterator it(root, ec), end; it != end && !ec; it.increment(ec)) {
+        if (ec) break;
+        if (!it->is_regular_file(ec)) { ec.clear(); continue; }
+
+        const am::fs::path p = it->path();
+        if (_stricmp(p.filename().u8string().c_str(), "game.gcl") != 0) continue;
+
+        if (norm(p.wstring()) == norm(inputPath.wstring())) continue;
+
+        std::error_code fec;
+        const auto sz = am::fs::file_size(p, fec);
+        if (fec || sz == 0) continue;
+
+        try {
+            std::string data = am::read_file(p);
+            if (data == inputData) continue;
+            if (!best.empty() && sz < bestSize) continue;
+            best = p;
+            bestSize = sz;
+        } catch (...) {
+        }
+    }
+
+    return best;
+}
+
 am::fs::path run_natives(const am::Result& R, const am::fs::path& cache, const am::fs::path& gcl, am::fs::path cur) {
     HMODULE nt = GetModuleHandleW(L"ntdll.dll"); PVOID cookie = nullptr;
     auto reg = nt ? (LdrRegister_t)GetProcAddress(nt, "LdrRegisterDllNotification") : nullptr;
@@ -244,7 +279,7 @@ am::fs::path run_natives(const am::Result& R, const am::fs::path& cache, const a
     for (auto& dll : R.natives) {
         am::fs::path srcDir = dll.parent_path(), modDir = srcDir.parent_path(), croot = modDir / ".cache";
         am::fs::path cdir = croot / "native", groot = croot / "game";
-        am::fs::path gin = groot / "bin" / "game.gcl", gout = groot / "anymaker_catalogue" / "game.gcl";
+        am::fs::path gin = groot / "bin" / "game.gcl";
         std::string name = modDir.filename().u8string() + "/" + dll.filename().u8string(); idx++;
         if (modDir != lastMod) {
             lastMod = modDir;
@@ -268,7 +303,19 @@ am::fs::path run_natives(const am::Result& R, const am::fs::path& cache, const a
         }
         std::string input = am::read_file(cur), old;
         if (am::fs::exists(gin)) { try { old = am::read_file(gin); } catch (...) {} }
-        if (old != input) am::fs::remove_all(groot / "anymaker_catalogue", ec);
+        if (old != input) {
+            std::error_code dec;
+            if (am::fs::is_directory(groot, dec)) {
+                for (am::fs::recursive_directory_iterator it(groot, dec), end; it != end && !dec; it.increment(dec)) {
+                    if (dec) break;
+                    if (!it->is_regular_file(dec)) { dec.clear(); continue; }
+                    if (_stricmp(it->path().filename().u8string().c_str(), "game.gcl") != 0) continue;
+                    if (norm(it->path().wstring()) == norm(gin.wstring())) continue;
+                    std::error_code rmec;
+                    am::fs::remove(it->path(), rmec);
+                }
+            }
+        }
         am::fs::create_directories(gin.parent_path(), ec); { std::ofstream f(gin, std::ios::binary); f << input; }
         g_exeStrs.push_back((groot / "game.exe").wstring()); g_loadingExe = g_exeStrs.back().c_str();
         HMODULE h = LoadLibraryExW(cached.c_str(), nullptr, LOAD_WITH_ALTERED_SEARCH_PATH);
@@ -280,12 +327,16 @@ am::fs::path run_natives(const am::Result& R, const am::fs::path& cache, const a
             if (fh != INVALID_HANDLE_VALUE) CloseHandle(fh);
         }
         hook_all();
-        std::error_code e2; bool have = am::fs::exists(gout, e2) && am::fs::file_size(gout, e2) > 0;
-        if (have) {
+        am::fs::path gout = find_native_gcl_output(groot, gin, input);
+        if (!gout.empty()) {
             std::string out = am::read_file(gout);
-            logmsg("  stage " + std::to_string(idx) + " (" + name + "): " + std::to_string(input.size()) + " -> " + std::to_string(out.size()) + " bytes" + (out == input ? " (no change)" : ""));
+            logmsg("  stage " + std::to_string(idx) + " (" + name + "): detected game.gcl output at " + gout.lexically_relative(groot).u8string() +
+                   " (" + std::to_string(input.size()) + " -> " + std::to_string(out.size()) + " bytes" +
+                   (out == input ? " (no change)" : "") + ")");
             cur = gout;
-        } else logmsg("  stage " + std::to_string(idx) + " (" + name + "): produced no game.gcl - its output is not used, see " + (groot / "anymaker_catalogue.log").u8string());
+        } else {
+            logmsg("  stage " + std::to_string(idx) + " (" + name + "): no modified game.gcl output detected");
+        }
     }
     if (cookie && unreg) unreg(cookie);
     return cur;
